@@ -31,6 +31,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from google.cloud import storage
 
 # --- 1. CONSTANTS ---
 LOGGER_NAME = "webscrap.audit"
@@ -85,6 +86,9 @@ class Settings:
     model: str
     raw_dir: Path
     cleaned_dir: Path
+    storage_backend: str
+    input_bucket: str
+    output_bucket: str
     audit_db: Path
     log_level: int
     console_logging: bool
@@ -107,6 +111,9 @@ def load_settings(session_id: str) -> Settings:
         model=os.getenv("GEMINI_MODEL", ""),
         raw_dir=Path("scrap_data"),
         cleaned_dir=Path("cleansed_data"),
+        storage_backend=os.getenv("STORAGE_BACKEND", "gcs").strip().lower(),
+        input_bucket=os.getenv("GCS_INPUT_BUCKET", "pmu-admission-rag-ingestion-input"),
+        output_bucket=os.getenv("GCS_OUTPUT_BUCKET", "pmu-admission-rag-ingestion-output"),
         audit_db=Path(os.getenv("AUDIT_DB_PATH", DEFAULT_AUDIT_DB)),
         log_level=parse_log_level(os.getenv("LOG_LEVEL")),
         console_logging=os.getenv("AUDIT_CONSOLE", "1") != "0",
@@ -124,6 +131,13 @@ def validate_settings(settings: Settings, audit: "AuditLog") -> bool:
         )
         if not value
     ]
+    if settings.storage_backend not in {"gcs", "local"}:
+        missing.append("STORAGE_BACKEND must be 'gcs' or 'local'")
+    if settings.storage_backend == "gcs":
+        if not settings.input_bucket:
+            missing.append("GCS_INPUT_BUCKET")
+        if not settings.output_bucket:
+            missing.append("GCS_OUTPUT_BUCKET")
     if missing:
         audit.error(f"Configuration invalid: missing environment variables {', '.join(missing)} (check .env)")
         return False
@@ -135,6 +149,8 @@ def validate_settings(settings: Settings, audit: "AuditLog") -> bool:
 
 def prepare_directories(settings: Settings) -> None:
     """Sub-logic: make sure input exists and output can be written."""
+    if settings.storage_backend == "gcs":
+        return
     if not settings.raw_dir.is_dir():
         raise FileNotFoundError(f"raw directory '{settings.raw_dir}' does not exist")
     settings.cleaned_dir.mkdir(parents=True, exist_ok=True)
@@ -301,11 +317,10 @@ def create_client(settings: Settings, audit: AuditLog) -> genai.Client:
 # --- 5. SINGLE-FILE PROCESSING ---
 
 
-def clean_file(client: genai.Client, settings: Settings, audit: AuditLog, raw_path: Path) -> str:
+def clean_text(client: genai.Client, settings: Settings, audit: AuditLog, file_name: str, raw_text: str) -> str:
     """Sub-logic: read one raw file and send it to Gemini."""
     try:
-        raw_text = raw_path.read_text(encoding="utf-8")
-        audit.debug(f"Sending '{raw_path.name}' to {settings.model} ({len(raw_text)} chars)")
+        audit.debug(f"Sending file '{file_name}' to {settings.model} ({len(raw_text)} chars)")
 
         response = client.models.generate_content(
             model=settings.model,
@@ -319,11 +334,15 @@ def clean_file(client: genai.Client, settings: Settings, audit: AuditLog, raw_pa
             raise ValueError("the model returned an empty response")
         return cleaned
     except Exception as exc:
-        audit.failure(f"Failed to clean '{raw_path.name}'", exc)
+        audit.failure(f"Failed to clean file '{file_name}'", exc)
         raise
 
 
-def process_file(client: genai.Client, settings: Settings, audit: AuditLog, raw_path: Path) -> str:
+def clean_local_file(client: genai.Client, settings: Settings, audit: AuditLog, raw_path: Path) -> str:
+    return clean_text(client, settings, audit, raw_path.name, raw_path.read_text(encoding="utf-8"))
+
+
+def process_local_file(client: genai.Client, settings: Settings, audit: AuditLog, raw_path: Path) -> str:
     """Sub-logic: clean one file and write it out. Returns processed|skipped|failed."""
     output_path = settings.cleaned_dir / raw_path.name
 
@@ -333,7 +352,7 @@ def process_file(client: genai.Client, settings: Settings, audit: AuditLog, raw_
 
     started = time.perf_counter()
     try:
-        cleaned = clean_file(client, settings, audit, raw_path)
+        cleaned = clean_local_file(client, settings, audit, raw_path)
     except Exception:
         return "failed"
 
@@ -344,7 +363,7 @@ def process_file(client: genai.Client, settings: Settings, audit: AuditLog, raw_
         return "failed"
 
     duration = time.perf_counter() - started
-    audit.info(f"Cleaned '{raw_path.name}' -> '{output_path}' ({len(cleaned)} chars in {duration:.2f}s)")
+    audit.info(f"Cleaned file '{raw_path.name}' -> '{output_path}' ({len(cleaned)} chars in {duration:.2f}s)")
     return "processed"
 
 
@@ -366,24 +385,97 @@ def discover_raw_files(settings: Settings, audit: AuditLog) -> list[Path]:
     return raw_files
 
 
+def discover_gcs_files(settings: Settings, audit: AuditLog) -> tuple[storage.Bucket, list[str]]:
+    """List input objects and return only objects absent from the output bucket."""
+    try:
+        client = storage.Client(project=settings.project_id)
+        input_bucket = client.bucket(settings.input_bucket)
+        output_bucket = client.bucket(settings.output_bucket)
+        input_names = sorted(
+            blob.name for blob in client.list_blobs(input_bucket)
+            if not blob.name.endswith("/")
+        )
+        output_names = {
+            blob.name for blob in client.list_blobs(output_bucket)
+            if not blob.name.endswith("/")
+        }
+    except Exception as exc:
+        audit.failure(
+            f"Failed to compare GCS buckets '{settings.input_bucket}' and '{settings.output_bucket}'",
+            exc,
+        )
+        raise
+
+    pending = [name for name in input_names if name not in output_names]
+    audit.info(
+        f"Compared GCS buckets (input_files={len(input_names)}, output_files={len(output_names)}, "
+        f"pending_files={len(pending)}, input_bucket='{settings.input_bucket}', "
+        f"output_bucket='{settings.output_bucket}')"
+    )
+    if not pending:
+        audit.info("No new files require cleansing")
+    else:
+        for name in pending:
+            audit.info(f"Queued file '{name}' for cleansing")
+    return output_bucket, pending
+
+
+def process_gcs_file(
+    client: genai.Client,
+    settings: Settings,
+    audit: AuditLog,
+    input_bucket: storage.Bucket,
+    output_bucket: storage.Bucket,
+    file_name: str,
+) -> str:
+    """Download, cleanse, and upload one GCS object using the same object name."""
+    started = time.perf_counter()
+    try:
+        input_blob = input_bucket.blob(file_name)
+        raw_text = input_blob.download_as_text(encoding="utf-8")
+        cleaned = clean_text(client, settings, audit, file_name, raw_text)
+        output_blob = output_bucket.blob(file_name)
+        output_blob.upload_from_string(cleaned, content_type="text/plain; charset=utf-8")
+    except Exception as exc:
+        audit.failure(f"Failed to process file '{file_name}'", exc)
+        return "failed"
+
+    duration = time.perf_counter() - started
+    audit.info(
+        f"Cleansed file '{file_name}' from gs://{settings.input_bucket}/{file_name} "
+        f"to gs://{settings.output_bucket}/{file_name} ({len(cleaned)} chars in {duration:.2f}s)"
+    )
+    return "processed"
+
+
 def run_pipeline(settings: Settings, audit: AuditLog) -> int:
     """Sub-logic: drive the whole run and return the process exit code."""
     started = time.perf_counter()
     audit.info(
         f"Pipeline started (session_id={settings.session_id}, model={settings.model}, "
-        f"raw_dir='{settings.raw_dir}', cleaned_dir='{settings.cleaned_dir}')"
+        f"storage_backend='{settings.storage_backend}', input_bucket='{settings.input_bucket}', "
+        f"output_bucket='{settings.output_bucket}')"
     )
 
     try:
         client = create_client(settings, audit)
-        raw_files = discover_raw_files(settings, audit)
+        if settings.storage_backend == "gcs":
+            storage_client = storage.Client(project=settings.project_id)
+            input_bucket = storage_client.bucket(settings.input_bucket)
+            output_bucket, raw_files = discover_gcs_files(settings, audit)
+        else:
+            input_bucket = output_bucket = None
+            raw_files = discover_raw_files(settings, audit)
     except Exception:
         audit.error("Pipeline aborted before processing any file")
         return 1
 
     counts = {"processed": 0, "skipped": 0, "failed": 0}
-    for raw_path in raw_files:
-        counts[process_file(client, settings, audit, raw_path)] += 1
+    for raw_file in raw_files:
+        if settings.storage_backend == "gcs":
+            counts[process_gcs_file(client, settings, audit, input_bucket, output_bucket, raw_file)] += 1
+        else:
+            counts[process_local_file(client, settings, audit, raw_file)] += 1
 
     duration = time.perf_counter() - started
     summary = (
@@ -433,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
 
     audit.info(
         f"Application run started (session_id={session_id}, model={settings.model}, "
-        f"log_level={logging.getLevelName(settings.log_level)})"
+        f"log_level={logging.getLevelName(settings.log_level)}, storage_backend={settings.storage_backend})"
     )
 
     if not validate_settings(settings, audit):
@@ -444,7 +536,13 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         audit.failure("Failed to prepare pipeline directories", exc)
         return 1
-    audit.info(f"Directories ready (raw='{settings.raw_dir}', cleaned='{settings.cleaned_dir}')")
+    if settings.storage_backend == "gcs":
+        audit.info(
+            f"GCS storage ready (input='gs://{settings.input_bucket}', "
+            f"output='gs://{settings.output_bucket}')"
+        )
+    else:
+        audit.info(f"Directories ready (raw='{settings.raw_dir}', cleaned='{settings.cleaned_dir}')")
 
     return run_pipeline(settings, audit)
 
