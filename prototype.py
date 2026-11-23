@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -149,13 +150,23 @@ class SqliteAuditStore:
         self.db_path = db_path
         if db_path.parent != Path(""):
             db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.executescript(AUDIT_SCHEMA)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @contextmanager
+    def _connection(self):
+        """Open a connection, commit on success and always close it (no leaks)."""
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
     def insert(
         self,
@@ -166,8 +177,7 @@ class SqliteAuditStore:
         resolved: int,
     ) -> int:
         """Append one audit row and return its auto-incremented audit_id."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             cursor = conn.execute(
                 f"""
                 INSERT INTO {AUDIT_TABLE}
@@ -176,23 +186,16 @@ class SqliteAuditStore:
                 """,
                 (session_id, log_type, log_message, timestamp, resolved),
             )
-            conn.commit()
             return int(cursor.lastrowid)
-        finally:
-            conn.close()
 
     def mark_resolved(self, audit_id: int) -> bool:
         """Flip resolved to 1; return True when a pending row was updated."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             cursor = conn.execute(
                 f"UPDATE {AUDIT_TABLE} SET resolved = 1 WHERE audit_id = ? AND resolved = 0",
                 (audit_id,),
             )
-            conn.commit()
             return cursor.rowcount > 0
-        finally:
-            conn.close()
 
 
 class AuditTableHandler(logging.Handler):
