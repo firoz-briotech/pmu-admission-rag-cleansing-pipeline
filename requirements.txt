@@ -1,3 +1,3 @@
-google-cloud-storage
-google-genai
-python-dotenv
+google-cloud-storage==3.17.1
+google-genai==3.6.1
+python-dotenv==1.2.4

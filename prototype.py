@@ -412,7 +412,9 @@ def discover_gcs_files(settings: Settings, audit: AuditLog) -> tuple[storage.Buc
         f"pending_files={len(pending)}, input_bucket='{settings.input_bucket}', "
         f"output_bucket='{settings.output_bucket}')"
     )
-    if not pending:
+    if not input_names:
+        audit.warning(f"No raw files found in input bucket '{settings.input_bucket}'")
+    elif not pending:
         audit.info("No new files require cleansing")
     else:
         for name in pending:
