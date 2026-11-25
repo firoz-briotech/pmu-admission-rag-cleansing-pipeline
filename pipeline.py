@@ -1,30 +1,30 @@
-"""Scrape-data cleansing pipeline with a SQLite-backed audit log (GCS backend).
+"""Scrape-data cleansing pipeline with structured JSON audit logging (GCS backend).
 
 The script is split into small sub-logics so every step can be audited on its
 own:
 
     1. imports + constants + configuration
-    2. audit table + custom logging handler
+    2. structured JSON audit log
     3. Gemini client
     4. GCS object processing
     5. pipeline orchestration
     6. CLI entry point
 
-Each sub-logic wraps its work in try/except and writes one audit row per
-outcome: `info` when it succeeds, `error` when it fails (plus `warning` and
-`debug` where useful).
+Each sub-logic wraps its work in try/except and writes one structured log line
+per outcome: `info` when it succeeds, `error` when it fails (plus `warning` and
+`debug` where useful). Each line is emitted as single-line JSON on stdout so
+Cloud Logging can parse it when the job runs on Cloud Run.
 """
 
 import argparse
+import json
 import logging
 import os
-import sqlite3
 import sys
 import time
+import traceback
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 
 from dotenv import load_dotenv
 from google import genai
@@ -33,36 +33,6 @@ from google.cloud import storage
 
 # --- 1. CONSTANTS & CONFIGURATION ---
 load_dotenv()
-
-LOGGER_NAME = "webscrap.audit"
-AUDIT_TABLE = "audit_log"
-DEFAULT_AUDIT_DB = "audit_logs.db"
-
-# log_type stored in the audit table, derived from the logging level.
-LOG_TYPE_BY_LEVEL = {
-    logging.DEBUG: "debug",
-    logging.INFO: "info",
-    logging.WARNING: "warning",
-    logging.ERROR: "error",
-    logging.CRITICAL: "critical",
-}
-
-# Rows that report progress need no follow-up; issues stay unresolved.
-AUTO_RESOLVED_TYPES = {"debug", "info"}
-
-AUDIT_SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
-    audit_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT    NOT NULL,
-    log_type    TEXT    NOT NULL,
-    log_message TEXT    NOT NULL,
-    timestamp   TEXT    NOT NULL,
-    resolved    INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_{AUDIT_TABLE}_session
-    ON {AUDIT_TABLE} (session_id);
-"""
 
 # This is where you define what "cleaning" means for your scrape data
 SYSTEM_PROMPT = """
@@ -86,9 +56,14 @@ LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "")
 MODEL = os.getenv("GEMINI_MODEL", "")
 INPUT_BUCKET = os.getenv("GCS_INPUT_BUCKET", "pmu-admission-rag-ingestion-input")
 OUTPUT_BUCKET = os.getenv("GCS_OUTPUT_BUCKET", "pmu-admission-rag-ingestion-output")
-AUDIT_DB_PATH = Path(os.getenv("AUDIT_DB_PATH", DEFAULT_AUDIT_DB))
 LOG_LEVEL = parse_log_level(os.getenv("LOG_LEVEL"))
-CONSOLE_LOGGING = os.getenv("AUDIT_CONSOLE", "1") != "0"
+SEVERITY_BY_LEVEL = {
+    logging.DEBUG:    "DEBUG",
+    logging.INFO:     "INFO",
+    logging.WARNING:  "WARNING",
+    logging.ERROR:    "ERROR",
+    logging.CRITICAL: "CRITICAL",
+}
 
 
 def validate_settings(audit: "AuditLog") -> bool:
@@ -116,141 +91,45 @@ def validate_settings(audit: "AuditLog") -> bool:
 # --- 2. AUDIT LOGGING ---
 
 
-class SqliteAuditStore:
-    """Persistence for the audit table. Swap this class for BigQuery/Postgres later."""
-
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connection() as conn:
-            conn.executescript(AUDIT_SCHEMA)
-
-    @contextmanager
-    def _connection(self):
-        """Open a connection, commit on success and always close it (no leaks)."""
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
-
-    def insert(
-        self,
-        session_id: str,
-        log_type: str,
-        log_message: str,
-        timestamp: str,
-        resolved: int,
-    ) -> int:
-        """Append one audit row and return its auto-incremented audit_id."""
-        with self._connection() as conn:
-            cursor = conn.execute(
-                f"""
-                INSERT INTO {AUDIT_TABLE}
-                    (session_id, log_type, log_message, timestamp, resolved)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (session_id, log_type, log_message, timestamp, resolved),
-            )
-            return int(cursor.lastrowid)
-
-    def mark_resolved(self, audit_id: int) -> bool:
-        """Flip resolved to 1; return True when a pending row was updated."""
-        with self._connection() as conn:
-            cursor = conn.execute(
-                f"UPDATE {AUDIT_TABLE} SET resolved = 1 WHERE audit_id = ? AND resolved = 0",
-                (audit_id,),
-            )
-            return cursor.rowcount > 0
-
-
-class AuditTableHandler(logging.Handler):
-    """Custom handler: every log record becomes one row in the audit table."""
-
-    def __init__(self, store: SqliteAuditStore, session_id: str, level: int = logging.NOTSET):
-        super().__init__(level)
-        self.store = store
-        self.session_id = session_id
-        self.last_audit_id: int | None = None
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            log_type = LOG_TYPE_BY_LEVEL.get(
-                record.levelno,
-                "error" if record.levelno >= logging.ERROR else "info",
-            )
-            timestamp = datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="seconds")
-            self.last_audit_id = self.store.insert(
-                session_id=getattr(record, "session_id", self.session_id),
-                log_type=log_type,
-                log_message=record.getMessage(),
-                timestamp=timestamp,
-                resolved=1 if log_type in AUTO_RESOLVED_TYPES else 0,
-            )
-        except Exception:
-            # A broken audit sink must never crash the pipeline.
-            self.handleError(record)
-
-
 class AuditLog:
-    """Thin facade over the standard logging module plus the audit table."""
-
-    def __init__(
-        self,
-        session_id: str,
-        store: SqliteAuditStore,
-        log_level: int = LOG_LEVEL,
-        console_logging: bool = CONSOLE_LOGGING,
-    ):
+    def __init__(self, session_id: str, log_level: int = LOG_LEVEL):
         self.session_id = session_id
-        self._store = store
-        self._logger = logging.getLogger(f"{LOGGER_NAME}.{session_id}")
-        self._logger.setLevel(log_level)
-        self._logger.propagate = False
-        self._logger.handlers.clear()
+        self._log_level = log_level
 
-        self._table = AuditTableHandler(store, session_id, log_level)
-        self._logger.addHandler(self._table)
+    def _emit(self, level: int, message: str, **extra) -> None:
+        if level < self._log_level:
+            return
+        entry = {
+            "severity": SEVERITY_BY_LEVEL.get(level, "DEFAULT"),
+            "message": message,
+            "session_id": self.session_id,
+            "timestamp": datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "logging.googleapis.com/labels": {"session_id": self.session_id},
+            **extra,
+        }
+        print(json.dumps(entry, default=str), file=sys.stdout, flush=True)
 
-        if console_logging:
-            console = logging.StreamHandler(sys.stdout)
-            console.setLevel(log_level)
-            console.setFormatter(
-                logging.Formatter(
-                    "%(asctime)s %(levelname)-5s [%(session_id)s] %(message)s",
-                    "%H:%M:%S",
-                )
-            )
-            self._logger.addHandler(console)
+    def debug(self, message: str) -> None:
+        self._emit(logging.DEBUG, message)
 
-    def _write(self, level: int, message: str) -> int | None:
-        self._logger.log(level, message, extra={"session_id": self.session_id})
-        return self._table.last_audit_id
+    def info(self, message: str) -> None:
+        self._emit(logging.INFO, message)
 
-    def debug(self, message: str) -> int | None:
-        return self._write(logging.DEBUG, message)
+    def warning(self, message: str) -> None:
+        self._emit(logging.WARNING, message)
 
-    def info(self, message: str) -> int | None:
-        return self._write(logging.INFO, message)
+    def error(self, message: str) -> None:
+        self._emit(logging.ERROR, message)
 
-    def warning(self, message: str) -> int | None:
-        return self._write(logging.WARNING, message)
-
-    def error(self, message: str) -> int | None:
-        return self._write(logging.ERROR, message)
-
-    def failure(self, message: str, exc: BaseException) -> int | None:
-        """Log an error row with a custom message that summarises the exception."""
-        return self._write(logging.ERROR, f"{message}: {type(exc).__name__}: {exc}")
-
-    def resolve(self, audit_id: int) -> bool:
-        resolved = self._store.mark_resolved(audit_id)
-        if resolved:
-            self.info(f"Audit entry {audit_id} marked as resolved")
-        else:
-            self.warning(f"Audit entry {audit_id} not found or already resolved")
-        return resolved
+    def failure(self, message: str, exc: BaseException) -> None:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        self._emit(
+            logging.ERROR,
+            f"{message}: {type(exc).__name__}: {exc}",
+            stack_trace=tb,
+        )
 
 
 # --- 3. GEMINI CLIENT ---
@@ -398,32 +277,11 @@ def run_pipeline(audit: AuditLog) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Clean scraped text files and audit every step.")
-    parser.add_argument(
-        "--resolve",
-        type=int,
-        metavar="AUDIT_ID",
-        help="mark an audit entry as resolved and exit",
-    )
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
 
     session_id = uuid.uuid4().hex
 
-    try:
-        store = SqliteAuditStore(AUDIT_DB_PATH)
-    except Exception:
-        # Audit table unavailable: fall back to the plain logging module.
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-        logging.getLogger(LOGGER_NAME).exception("Audit table unavailable at '%s'", AUDIT_DB_PATH)
-        return 1
-
-    audit = AuditLog(session_id, store)
-
-    if args.resolve is not None:
-        if args.resolve <= 0:
-            audit.error(f"Invalid audit id '{args.resolve}': expected a positive integer")
-            return 1
-        audit.resolve(args.resolve)
-        return 0
+    audit = AuditLog(session_id)
 
     audit.info(
         f"Application run started (session_id={session_id}, model={MODEL}, "
