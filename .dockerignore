@@ -1,0 +1,16 @@
+# Local secrets and runtime state must never enter the build context.
+.env
+.env.*
+*.env
+audit_logs.db
+audit_logs.db-journal
+
+# Local tooling / VCS
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+prototype*.py
+temp.py
+*.md
