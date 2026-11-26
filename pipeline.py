@@ -37,7 +37,8 @@ load_dotenv()
 # This is where you define what "cleaning" means for your scrape data
 SYSTEM_PROMPT = """
 You are a data cleaning assistant. The user will give you raw scraped text from a website crawler.
-Your job is to extract ONLY the main content — the actual information in the center of the page.
+Your job is to extract the source URL as it is at top and ONLY the main content — the actual information in the center of the page. And if you found the pdf links, try to extract the text from it and store in same file name with _pdf. The data should be useful to ingest in the RAG system.
+Exclude .md files, no need to process them.
 Remove: navigation menus, headers, footers, ads, breadcrumbs, repeated links, boilerplate text.
 Keep: article body, descriptions, main text, factual content.
 Return ONLY the cleaned text, nothing else. No explanations, no preamble.
