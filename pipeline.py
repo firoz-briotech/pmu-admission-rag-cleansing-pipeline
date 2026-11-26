@@ -174,12 +174,21 @@ def clean_text(client: genai.Client, audit: AuditLog, file_name: str, raw_text: 
         raise
 
 
-def discover_gcs_files(audit: AuditLog) -> tuple[storage.Bucket, storage.Bucket, list[str]]:
+def discover_gcs_files(audit: AuditLog, force_reprocess: bool = False) -> tuple[storage.Bucket, storage.Bucket, list[str]]:
     """List input objects and return only objects absent from the output bucket."""
     try:
         storage_client = storage.Client(project=PROJECT_ID)
         input_bucket = storage_client.bucket(INPUT_BUCKET)
         output_bucket = storage_client.bucket(OUTPUT_BUCKET)
+
+        if force_reprocess:
+            audit.warning("force-reprocess enabled: deleting all output bucket files")
+            blobs_to_delete = list(storage_client.list_blobs(output_bucket))
+            for blob in blobs_to_delete:
+                blob.delete()
+            audit.warning(f"Deleted {len(blobs_to_delete)} files from output bucket '{OUTPUT_BUCKET}'")
+            output_names = set()  # Empty set → all input files become pending
+
         input_names = sorted(
             blob.name for blob in storage_client.list_blobs(input_bucket)
             if not blob.name.endswith("/")
@@ -241,7 +250,7 @@ def process_gcs_file(
 # --- 5. PIPELINE ORCHESTRATION ---
 
 
-def run_pipeline(audit: AuditLog) -> int:
+def run_pipeline(audit: AuditLog, force_reprocess: bool = False) -> int:
     """Sub-logic: drive the whole run and return the process exit code."""
     started = time.perf_counter()
     audit.info(
@@ -251,7 +260,7 @@ def run_pipeline(audit: AuditLog) -> int:
 
     try:
         client = create_client(audit)
-        input_bucket, output_bucket, raw_files = discover_gcs_files(audit)
+        input_bucket, output_bucket, raw_files = discover_gcs_files(audit, force_reprocess)
     except Exception:
         audit.error("Pipeline aborted before processing any file")
         return 1
@@ -277,7 +286,14 @@ def run_pipeline(audit: AuditLog) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Clean scraped text files and audit every step.")
-    parser.parse_args(argv)
+
+    #for testing purpose only
+    parser.add_argument(
+    "--force-reprocess",
+    action="store_true",
+    help="Delete all output bucket files before running (testing only)"
+    )
+    args = parser.parse_args(argv)
 
     session_id = uuid.uuid4().hex
 
@@ -295,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         f"GCS storage ready (input='gs://{INPUT_BUCKET}', output='gs://{OUTPUT_BUCKET}')"
     )
 
-    return run_pipeline(audit)
+    return run_pipeline(audit, force_reprocess=args.force_reprocess)
 
 
 if __name__ == "__main__":
